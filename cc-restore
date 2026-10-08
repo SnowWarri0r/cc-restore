@@ -189,8 +189,18 @@ def osa_str(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+class OpenFailed(Exception):
+    pass
+
+
 def osascript(lines):
-    subprocess.run(["osascript", "-"], input="\n".join(lines), text=True, check=True)
+    try:
+        r = subprocess.run(["osascript", "-"], input="\n".join(lines), text=True,
+                           capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise OpenFailed("the terminal did not respond within 30s")
+    if r.returncode:
+        raise OpenFailed(r.stderr.strip())
 
 
 def open_ghostty(entries):
@@ -329,7 +339,14 @@ def cmd_restore(a):
     chosen = entries if a.all else pick(entries)
     if chosen is None:
         return
-    TERMINALS[a.terminal or detect_terminal()](chosen)
+    terminal = a.terminal or detect_terminal()
+    try:
+        TERMINALS[terminal](chosen)
+    except (OpenFailed, subprocess.CalledProcessError) as err:
+        sys.exit(f"cc-restore: could not open {terminal} tabs: {err}\n"
+                 "On macOS, allow control of the terminal in System Settings → "
+                 "Privacy & Security → Automation, dismiss any dialog it shows, "
+                 "then run cc-restore again. Nothing was removed from the list.")
     # reopened sessions re-register on start; skipped ones are dropped for good
     for e in entries:
         e["_path"].unlink(missing_ok=True)
