@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""cc-restore: reopen the Claude Code sessions a restart killed, one tab each.
+
+  cc-restore install      register the SessionStart/SessionEnd hooks
+  cc-restore uninstall    remove them
+  cc-restore              list killed sessions, pick which to reopen
+  cc-restore --all        reopen all without asking
+  cc-restore --list       only list
+  cc-restore hook         (called by Claude Code) maintain the registry
+
+Sessions you leave on purpose (/exit, Ctrl-D, double Ctrl-C, /clear) are
+dropped from the registry. Sessions that die with their terminal (tab or
+window closed, terminal quit, machine reboot) stay and show up here.
+"""
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+LIVE = CONFIG / "cc-restore" / "live"
+SETTINGS = CONFIG / "settings.json"
+DELIBERATE_END = {"prompt_input_exit", "logout", "clear"}
+HOOK_EVENTS = ("SessionStart", "SessionEnd")
+
+
+# ---------------------------------------------------------------- processes
+
+def ps(pid, field):
+    return subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def is_claude(pid):
+    return os.path.basename(ps(pid, "comm")) == "claude"
+
+
+def claude_ancestor():
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            return None
+        if is_claude(pid):
+            return pid
+        ppid = ps(pid, "ppid")
+        if not ppid:
+            return None
+        pid = int(ppid)
+    return None
+
+
+def alive_claude(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return is_claude(pid)
+
+
+# ---------------------------------------------------------------- registry
+
+def write_entry(sid, cwd, transcript, pid, source):
+    LIVE.mkdir(parents=True, exist_ok=True)
+    entry = {"session_id": sid, "cwd": cwd, "transcript_path": transcript,
+             "pid": pid, "source": source, "updated_at": time.time()}
+    (LIVE / f"{sid}.json").write_text(json.dumps(entry, ensure_ascii=False))
+
+
+def cmd_hook():
+    try:
+        data = json.load(sys.stdin)
+        sid = data.get("session_id")
+        if not sid:
+            return
+        path = LIVE / f"{sid}.json"
+        event = data.get("hook_event_name")
+        if event == "SessionEnd":
+            if data.get("reason") in DELIBERATE_END:
+                path.unlink(missing_ok=True)
+            return
+        if event != "SessionStart":
+            return
+        pid = claude_ancestor()
+        if pid is None:
+            return
+        args = ps(pid, "args").split()
+        if "-p" in args or "--print" in args:  # headless runs have no tab
+            return
+        write_entry(sid, data.get("cwd") or os.getcwd(),
+                    data.get("transcript_path"), pid, data.get("source"))
+    except Exception:
+        pass  # a registry hiccup must never disturb the session
+
+
+def seed_running():
+    """Register sessions that were already running before install."""
+    n = 0
+    for f in (CONFIG / "sessions").glob("*.json"):
+        try:
+            s = json.loads(f.read_text())
+        except ValueError:
+            continue
+        pid, sid, cwd = s.get("pid"), s.get("sessionId"), s.get("cwd")
+        if s.get("kind") != "interactive" or not (pid and sid and cwd):
+            continue
+        if not alive_claude(pid):
+            continue
+        transcript = next(CONFIG.glob(f"projects/*/{sid}.jsonl"), None)
+        if transcript is None:
+            continue
+        write_entry(sid, cwd, str(transcript), pid, "seed")
+        n += 1
+    return n
+
+
+def title_of(transcript):
+    custom = ai = first = None
+    try:
+        with open(transcript, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"custom-title"' not in line and '"ai-title"' not in line \
+                        and (first or '"type":"user"' not in line):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                t = rec.get("type")
+                if t == "custom-title":
+                    custom = rec.get("customTitle") or rec.get("title") or custom
+                elif t == "ai-title":
+                    ai = rec.get("aiTitle") or ai
+                elif t == "user" and not first and not rec.get("isMeta"):
+                    c = rec.get("message", {}).get("content")
+                    if isinstance(c, list):
+                        c = next((x.get("text") for x in c if isinstance(x, dict)
+                                  and x.get("type") == "text"), None)
+                    if isinstance(c, str) and not c.startswith("<"):
+                        first = c
+    except OSError:
+        return "(untitled)"
+    return " ".join((custom or ai or first or "(untitled)").split())[:70]
+
+
+def load(days):
+    entries = []
+    for p in LIVE.glob("*.json"):
+        try:
+            e = json.loads(p.read_text())
+        except ValueError:
+            p.unlink(missing_ok=True)
+            continue
+        tp = e.get("transcript_path")
+        if not tp or not os.path.exists(tp):  # never got a message: nothing to resume
+            p.unlink(missing_ok=True)
+            continue
+        e["_path"], e["mtime"] = p, os.path.getmtime(tp)
+        entries.append(e)
+
+    # one process can hop sessions (/resume inside a session): keep its latest
+    by_pid = {}
+    for e in sorted(entries, key=lambda e: e["updated_at"]):
+        if e["pid"] in by_pid:
+            by_pid[e["pid"]]["_path"].unlink(missing_ok=True)
+        by_pid[e["pid"]] = e
+
+    cutoff = time.time() - days * 86400
+    out = [e for e in by_pid.values()
+           if e["mtime"] >= cutoff and not alive_claude(e["pid"])]
+    for e in out:
+        e["title"] = title_of(e["transcript_path"])
+    return sorted(out, key=lambda e: e["mtime"], reverse=True)
+
+
+# ---------------------------------------------------------------- terminals
+
+def resume_cmd(e):
+    return f"claude --resume {shlex.quote(e['session_id'])}"
+
+
+def osa_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def osascript(lines):
+    subprocess.run(["osascript", "-"], input="\n".join(lines), text=True, check=True)
+
+
+def open_ghostty(entries):
+    # Ghostty >= 1.3 AppleScript: new tab with a surface configuration
+    lines = ['tell application "Ghostty"', "activate"]
+    for i, e in enumerate(entries):
+        lines += ["set cfg to new surface configuration",
+                  f"set initial working directory of cfg to {osa_str(e['cwd'])}",
+                  f"set initial input of cfg to {osa_str(resume_cmd(e) + chr(10))}"]
+        if i == 0:
+            lines += ["if (count of windows) is 0 then",
+                      "  set w to new window with configuration cfg",
+                      "else",
+                      "  set w to front window",
+                      "  new tab in w with configuration cfg",
+                      "end if"]
+        else:
+            lines.append("new tab in w with configuration cfg")
+    osascript(lines + ["end tell"])
+
+
+def open_iterm(entries):
+    lines = ['tell application "iTerm"', "activate",
+             "if (count of windows) is 0 then create window with default profile",
+             "set w to current window"]
+    for i, e in enumerate(entries):
+        text = f"cd {shlex.quote(e['cwd'])} && {resume_cmd(e)}"
+        lines += ["tell w to set t to (create tab with default profile)",
+                  f"tell current session of t to write text {osa_str(text)}"]
+    osascript(lines + ["end tell"])
+
+
+def open_tmux(entries):
+    for e in entries:
+        subprocess.run(["tmux", "new-window", "-c", e["cwd"],
+                        "-n", e["title"][:20], resume_cmd(e)], check=True)
+
+
+def open_print(entries):
+    print("\nRun these, one per tab:")
+    for e in entries:
+        print(f"  cd {shlex.quote(e['cwd'])} && {resume_cmd(e)}")
+
+
+TERMINALS = {"ghostty": open_ghostty, "iterm": open_iterm,
+             "tmux": open_tmux, "print": open_print}
+
+
+def detect_terminal():
+    if os.environ.get("TMUX"):
+        return "tmux"
+    prog = os.environ.get("TERM_PROGRAM", "").lower()
+    if prog == "ghostty":
+        return "ghostty"
+    if prog == "iterm.app":
+        return "iterm"
+    return "print"
+
+
+# ---------------------------------------------------------------- install
+
+def hook_command():
+    return f"{shlex.quote(str(Path(__file__).resolve()))} hook"
+
+
+def is_ours(group):
+    return any("cc-restore" in h.get("command", "") and h.get("command", "").endswith(" hook")
+               for h in group.get("hooks", []))
+
+
+def load_settings():
+    return json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+
+
+def save_settings(s):
+    if SETTINGS.exists():
+        shutil.copy2(SETTINGS, SETTINGS.with_name(f"settings.json.bak-{int(time.time())}"))
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
+
+
+def strip_ours(s):
+    hooks = s.get("hooks", {})
+    for ev in HOOK_EVENTS:
+        if ev in hooks:
+            hooks[ev] = [g for g in hooks[ev] if not is_ours(g)]
+            if not hooks[ev]:
+                del hooks[ev]
+    if "hooks" in s and not s["hooks"]:
+        del s["hooks"]
+
+
+def cmd_install():
+    s = load_settings()
+    strip_ours(s)
+    group = {"hooks": [{"type": "command", "command": hook_command()}]}
+    for ev in HOOK_EVENTS:
+        s.setdefault("hooks", {}).setdefault(ev, []).append(group)
+    save_settings(s)
+    print(f"Hooks registered in {SETTINGS}")
+    print(f"Registered {seed_running()} already-running session(s).")
+
+
+def cmd_uninstall():
+    s = load_settings()
+    strip_ours(s)
+    save_settings(s)
+    print(f"Hooks removed from {SETTINGS}. Registry left at {LIVE}.")
+
+
+# ---------------------------------------------------------------- restore
+
+def pick(entries):
+    ans = input("\nEnter = all | 1 3 = only these | -2 4 = all but these | q = quit: ").strip()
+    if ans == "q":
+        return None
+    if not ans:
+        return entries
+    nums = {int(x) for x in ans.lstrip("-").replace(",", " ").split() if x.isdigit()}
+    keep = (lambda i: i not in nums) if ans.startswith("-") else (lambda i: i in nums)
+    return [e for i, e in enumerate(entries, 1) if keep(i)]
+
+
+def cmd_restore(a):
+    entries = load(a.days)
+    if not entries:
+        print("Nothing to restore.")
+        return
+    home = str(Path.home())
+    for i, e in enumerate(entries, 1):
+        when = time.strftime("%m-%d %H:%M", time.localtime(e["mtime"]))
+        cwd = e["cwd"].replace(home, "~", 1)
+        print(f"{i:>3}  {when}  {cwd:<28}  {e['title']}")
+    if a.list:
+        return
+    chosen = entries if a.all else pick(entries)
+    if chosen is None:
+        return
+    TERMINALS[a.terminal or detect_terminal()](chosen)
+    # reopened sessions re-register on start; skipped ones are dropped for good
+    for e in entries:
+        e["_path"].unlink(missing_ok=True)
+    print(f"Reopened {len(chosen)} session(s).")
+
+
+def main():
+    if sys.argv[1:2] == ["hook"]:
+        return cmd_hook()
+    ap = argparse.ArgumentParser(prog="cc-restore", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", nargs="?", choices=["install", "uninstall"])
+    ap.add_argument("--all", action="store_true", help="reopen all without asking")
+    ap.add_argument("--list", action="store_true", help="only list")
+    ap.add_argument("--days", type=float, default=7, help="look back N days (default 7)")
+    ap.add_argument("--terminal", choices=sorted(TERMINALS), help="override auto-detection")
+    a = ap.parse_args()
+    if a.action == "install":
+        return cmd_install()
+    if a.action == "uninstall":
+        return cmd_uninstall()
+    cmd_restore(a)
+
+
+if __name__ == "__main__":
+    main()
