@@ -359,19 +359,33 @@ def cmd_uninstall():
 # ---------------------------------------------------------------- restore
 
 def pick(entries):
-    ans = input("\nEnter = all | 1 3 = only these | -2 4 = all but these | q = quit: ")
+    ans = input("\nEnter = all | 1 3 = only these | -2 4 = all but these (and forget them) | q = quit: ")
     return select(entries, ans)
 
 
 def select(entries, ans):
+    """Return (to_reopen, to_forget); None for quit.
+
+    "" / "all"  reopen everything
+    "1 3"       reopen these, leave the rest listed
+    "-2 4"      reopen the rest, forget these
+    """
     ans = ans.strip()
     if ans == "q":
         return None
     if ans in ("", "all"):
-        return entries
+        return entries, []
     nums = {int(x) for x in ans.lstrip("-").replace(",", " ").split() if x.isdigit()}
-    keep = (lambda i: i not in nums) if ans.startswith("-") else (lambda i: i in nums)
-    return [e for i, e in enumerate(entries, 1) if keep(i)]
+    listed = [i in nums for i in range(1, len(entries) + 1)]
+    if ans.startswith("-"):
+        return ([e for e, hit in zip(entries, listed) if not hit],
+                [e for e, hit in zip(entries, listed) if hit])
+    return [e for e, hit in zip(entries, listed) if hit], []
+
+
+def forget_all(entries):
+    for e in entries:
+        e["_path"].unlink(missing_ok=True)
 
 
 def cmd_restore(a):
@@ -387,12 +401,17 @@ def cmd_restore(a):
     if a.list:
         return
     if a.all:
-        chosen = entries
+        picked = entries, []
     elif a.pick is not None:
-        chosen = select(entries, a.pick)
+        picked = select(entries, a.pick)
     else:
-        chosen = pick(entries)
-    if chosen is None:
+        picked = pick(entries)
+    if picked is None:
+        return
+    chosen, forget = picked
+    if not chosen:
+        forget_all(forget)
+        print(f"Forgot {len(forget)} session(s).")
         return
     terminal = a.terminal or detect_terminal()
     try:
@@ -402,10 +421,11 @@ def cmd_restore(a):
                  "On macOS, allow control of the terminal in System Settings → "
                  "Privacy & Security → Automation, dismiss any dialog it shows, "
                  "then run cc-restore again. Nothing was removed from the list.")
-    # reopened sessions re-register on start; skipped ones are dropped for good
-    for e in entries:
-        e["_path"].unlink(missing_ok=True)
-    print(f"Reopened {len(chosen)} session(s).")
+    forget_all(forget)
+    # each reopened session overwrites its own record when it starts; until
+    # then the record stays, so a tab closed at the trust prompt is not lost
+    print(f"Reopened {len(chosen)} session(s)."
+          + (f" Forgot {len(forget)}." if forget else ""))
 
 
 def main():

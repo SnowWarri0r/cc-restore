@@ -1,6 +1,6 @@
 {
   "name": "cc-restore",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reopen the Claude Code sessions a restart killed, one terminal tab each (Ghostty, iTerm2, tmux).",
   "author": { "name": "SnowWarri0r" },
   "repository": "https://github.com/SnowWarri0r/cc-restore",
