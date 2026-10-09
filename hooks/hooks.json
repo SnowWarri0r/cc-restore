@@ -1,0 +1,11 @@
+{
+  "description": "Record interactive sessions so cc-restore can reopen the ones a restart killed",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cc-restore\" hook" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cc-restore\" hook" } ] }
+    ]
+  }
+}
