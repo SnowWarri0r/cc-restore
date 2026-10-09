@@ -95,8 +95,8 @@ Inside Claude Code:
 ```
 /cc-restore:restore          # show the list, then ask which to reopen
 /cc-restore:restore all      # reopen everything
-/cc-restore:restore 1 3      # only #1 and #3
-/cc-restore:restore -2       # everything except #2
+/cc-restore:restore 1 3      # only #1 and #3; the rest stay listed
+/cc-restore:restore -2       # everything except #2, and forget #2
 ```
 
 From a shell:
@@ -110,8 +110,9 @@ cc-restore --days 30         # look back further (default: 7 days)
 cc-restore --terminal tmux   # override terminal detection
 ```
 
-Sessions you leave out are dropped from the list. Their transcripts are untouched,
-so `claude --resume` still finds them.
+Only sessions you exclude with `-N` leave the list; anything you simply did not pick
+stays for next time. Forgetting a session only removes it from this list — its
+transcript is untouched, so `claude --resume` still finds it.
 
 ## Terminals
 
@@ -129,8 +130,8 @@ respond, cc-restore stops after 30 seconds and leaves the list as it was.
 ## Good to know
 
 - **Closing a tab counts as "cut off".** cc-restore cannot tell a tab you closed on
-  purpose from one a reboot took down; leave it out when you restore (`-N`) and it
-  is gone from the list.
+  purpose from one a reboot took down; exclude it with `-N` when you restore and
+  it is gone from the list.
 - **Trust prompts.** If a directory is not permanently trusted — your home directory,
   for instance — each session reopened there waits at Claude Code's "Do you trust
   this folder?" prompt until you answer it.
