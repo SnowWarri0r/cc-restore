@@ -1,50 +1,74 @@
 # cc-restore
 
-Reopen every Claude Code session a restart killed — one terminal tab each, back in
-its original directory, conversation intact.
+Restarted your machine with a dozen Claude Code sessions open? Get them all back in
+one go — each in its own terminal tab, in its original directory, with the
+conversation intact.
 
 ```
-$ cc-restore
-  1  10-08 16:24  ~/work/api                Fix flaky integration test
-  2  10-08 15:51  ~/work/web                Migrate settings page to new form lib
-  3  10-08 11:02  ~                         Weekly report draft
+$ claude
+  ⎿  cc-restore: 3 Claude Code sessions closed with the terminal.
+     Run /cc-restore:restore to reopen them.
 
-Enter = all | 1 3 = only these | -2 4 = all but these | q = quit:
-Reopened 3 session(s).
+> /cc-restore:restore
+  1  10-08 16:24  ~/work/api       Fix flaky integration test
+  2  10-08 15:51  ~/work/web       Migrate settings page to new form lib
+  3  10-08 11:02  ~                Weekly report draft
+
+  Reopen all of them, or pick some (e.g. 1 3, or -2 for all but #2)?
+
+> all
+  Reopened 3 session(s).
 ```
 
-If you keep a dozen `claude` sessions open across tabs, a terminal crash, an OS update
-or a reboot means hunting each one down in `claude --resume` by hand. cc-restore keeps
-track of them for you.
+## Why not just `claude --resume`?
+
+cc-restore calls `claude --resume` under the hood. What it adds is the bookkeeping
+around it:
+
+| | `claude --resume` | cc-restore |
+|---|---|---|
+| What it lists | every past session, ones you finished and ones that were cut off alike | only sessions that were still open when the terminal went away |
+| Restoring ten sessions | ten rounds of: open a tab, `cd`, `claude --resume`, find the right one | one command, one tab per session |
+| Working directory | yours to get right (`claude -c` only picks the latest in the current directory) | each session reopens where it was |
+| After a restart | you have to remember what was open | the first new session tells you what is waiting |
+
+It is not a replacement for `--resume`: to dig up a session you closed on purpose
+last month, use `--resume`.
 
 ## How it works
 
-- A `SessionStart` hook records each interactive session (id, working directory,
-  transcript) in `~/.claude/cc-restore/live/`.
-- A `SessionEnd` hook removes the record when you leave on purpose — `/exit`,
-  Ctrl-D, double Ctrl-C, `/clear`.
-- A session that dies with its terminal (tab or window closed, terminal quit, machine
-  reboot) keeps its record. The next `claude` you start tells you how many are
-  waiting, and `/cc-restore:restore` (or `cc-restore` in a shell) reopens the ones
-  you pick with `claude --resume <id>`. A resumed session keeps its id and registers
-  itself again.
+- A `SessionStart` hook records every interactive session — id, working directory,
+  transcript path, process id — in `~/.claude/cc-restore/live/`.
+- A `SessionEnd` hook removes the record when you leave on purpose: `/exit`, Ctrl-D,
+  double Ctrl-C, `/clear`.
+- A session that dies with its terminal — tab or window closed, terminal quit,
+  machine rebooted — keeps its record.
+- Restoring lists the records whose process is gone and reopens the ones you pick
+  with `claude --resume <id>`. A reopened session keeps its id and records itself
+  again, so the cycle repeats.
 
-Titles come from your `/rename` name, then Claude's auto title, then the first prompt.
-Name your sessions with `/rename` and the list reads at a glance.
+Each entry is titled with your `/rename` name, else Claude's auto-generated title,
+else the first prompt. Naming sessions with `/rename` makes the list easy to scan.
 
 ## Install
 
-Requires Python 3.8+ (standard library only).
+Requires Python 3.8+ (standard library only) and macOS or Linux.
 
 ### As a Claude Code plugin (recommended)
+
+In Claude Code:
 
 ```
 /plugin marketplace add SnowWarri0r/cc-restore
 /plugin install cc-restore@cc-restore
 ```
 
-The hooks come with the plugin; nothing in your settings is edited. To also have the
-`cc-restore` shell command, add the stable link the plugin maintains to your `PATH`:
+The hooks ship with the plugin; your settings files are not touched. Sessions you
+start from now on are tracked. Sessions that were already open when you installed
+are tracked from the next time they start.
+
+To also run `cc-restore` from a shell, put the link the plugin keeps up to date on
+your `PATH`:
 
 ```sh
 export PATH="$HOME/.claude/cc-restore/bin:$PATH"
@@ -58,55 +82,71 @@ ln -s ~/cc-restore/bin/cc-restore ~/.local/bin/cc-restore   # any directory on y
 cc-restore install
 ```
 
-`install` adds the two hooks to `~/.claude/settings.json` (a timestamped backup is
-written next to it) and registers the sessions that are already running, so the very
-next restart is covered. `cc-restore uninstall` removes the hooks. Pick one of the two
-install methods, not both. `CLAUDE_CONFIG_DIR` is respected.
+`install` adds the two hooks to `~/.claude/settings.json`, writing a timestamped
+backup next to it first, and records the sessions that are already running so the
+very next restart is covered.
+
+Use one install method, not both. `CLAUDE_CONFIG_DIR` is respected either way.
 
 ## Usage
 
 Inside Claude Code:
 
 ```
-/cc-restore:restore          # show the list and ask which to reopen
-/cc-restore:restore all
-/cc-restore:restore 1 3      # only these
-/cc-restore:restore -2       # all but these
+/cc-restore:restore          # show the list, then ask which to reopen
+/cc-restore:restore all      # reopen everything
+/cc-restore:restore 1 3      # only #1 and #3
+/cc-restore:restore -2       # everything except #2
 ```
 
 From a shell:
 
 ```sh
-cc-restore              # list killed sessions, pick which to reopen
-cc-restore --all        # reopen all without asking
-cc-restore --pick "1 3" # same choices as above, non-interactive
-cc-restore --list       # only list
-cc-restore --days 30    # look further back (default: 7 days)
+cc-restore                   # show the list, then ask
+cc-restore --all             # reopen everything
+cc-restore --pick "1 3"      # same choices as above, without the prompt
+cc-restore --list            # just show the list
+cc-restore --days 30         # look back further (default: 7 days)
 cc-restore --terminal tmux   # override terminal detection
 ```
 
-Sessions you skip are dropped from the list; their transcripts stay, so
-`claude --resume` still finds them.
+Sessions you leave out are dropped from the list. Their transcripts are untouched,
+so `claude --resume` still finds them.
 
 ## Terminals
 
-| Terminal | How sessions reopen | Detected by |
+| Terminal | Sessions reopen as | Detected by |
 |---|---|---|
-| Ghostty 1.3+ (macOS) | new tab in the front window | `TERM_PROGRAM=ghostty` |
-| iTerm2 (macOS) | new tab in the current window | `TERM_PROGRAM=iTerm.app` |
-| tmux (any OS) | new window per session, named after it | `$TMUX` |
-| anything else | prints one `cd … && claude --resume …` line per session | fallback |
+| Ghostty 1.3+ (macOS) | tabs in the front window | `TERM_PROGRAM=ghostty` |
+| iTerm2 (macOS) | tabs in the current window | `TERM_PROGRAM=iTerm.app` |
+| tmux (macOS, Linux) | one window per session, named after it | `$TMUX` |
+| anything else | printed `cd … && claude --resume …` lines to paste | fallback |
 
-On macOS the first run asks for permission to control the terminal app
-(System Settings → Privacy & Security → Automation).
+The first time cc-restore drives Ghostty or iTerm2, macOS asks whether to allow it
+(System Settings → Privacy & Security → Automation). If the terminal does not
+respond, cc-restore stops after 30 seconds and leaves the list as it was.
 
-## Notes
+## Good to know
 
-- Claude Code asks "Do you trust this folder?" when a directory has not been trusted
-  permanently (your home directory, for one). Restored tabs in such a directory stop
-  at that prompt until you answer it.
-- Headless runs (`claude -p`) are not recorded.
-- Sessions that never got a message have no transcript and are skipped.
+- **Closing a tab counts as "cut off".** cc-restore cannot tell a tab you closed on
+  purpose from one a reboot took down; leave it out when you restore (`-N`) and it
+  is gone from the list.
+- **Trust prompts.** If a directory is not permanently trusted — your home directory,
+  for instance — each session reopened there waits at Claude Code's "Do you trust
+  this folder?" prompt until you answer it.
+- **Not restored:** tab order, splits and window layout, and the terminal's
+  scrollback. The conversation itself is fully restored.
+- **Skipped automatically:** headless runs (`claude -p`), and sessions that never got
+  a message (there is nothing to resume).
+
+## Uninstall
+
+```
+/plugin uninstall cc-restore@cc-restore      # plugin
+cc-restore uninstall                         # standalone
+```
+
+Then remove the session records with `rm -rf ~/.claude/cc-restore`.
 
 ## License
 
